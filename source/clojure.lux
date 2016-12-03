@@ -1,0 +1,263 @@
+##  Copyright (c) Eduardo Julian. All rights reserved.
+##  This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+##  If a copy of the MPL was not distributed with this file,
+##  You can obtain one at http://mozilla.org/MPL/2.0/.
+
+(;module:
+  lux
+  (lux (control monad)
+       (codata [io])
+       [compiler #+ Monad<Lux>]
+       (data [text "Text/" Eq<Text>]
+             text/format
+             [product]
+             (struct [array]
+                     [list "List/" Monad<List>]))
+       (macro [ast]
+              ["s" syntax #+ syntax:])
+       [host #+ jvm-import]))
+
+(jvm-import clojure.lang.IDeref
+  (deref [] #? Object))
+
+(jvm-import clojure.lang.Var
+  (isBound [] boolean))
+
+(jvm-import clojure.lang.ISeq)
+
+(jvm-import clojure.lang.ArraySeq
+  (#static create [(Array Object)] ArraySeq))
+
+(jvm-import clojure.lang.Symbol
+  (#static create [String String] Symbol))
+
+(jvm-import clojure.lang.Keyword
+  (#static intern [Symbol] Keyword))
+
+(do-template [<name> <class> <method>]
+  [(def: #export <name>
+     (-> Ident <class>)
+     <method>)]
+
+  [symbol  Symbol  Symbol.create]
+  [keyword Keyword (|>. Symbol.create Keyword.intern)])
+
+(jvm-import clojure.lang.IFn
+  (applyTo [ISeq] #? Object))
+
+(jvm-import clojure.java.api.Clojure
+  (#static var [Object Object] IFn))
+
+(jvm-import java.lang.Object
+  (toString [] String))
+
+(def: #hidden (find-var name)
+  (-> Ident Object)
+  (|> name
+      Clojure.var
+      (:! Var)
+      (@post (Var.isBound []))
+      (IDeref.deref [])
+      (default (host;null))
+      ))
+
+(def: #hidden clojure.core/require
+  IFn
+  (:! IFn (find-var ["clojure.core" "require"])))
+
+(def: (list-to-seq xs)
+  (-> (List Object) ArraySeq)
+  (|> xs array;from-list ArraySeq.create))
+
+(def: #hidden (apply args f)
+  (-> (List Object) IFn (Maybe Object))
+  (IFn.applyTo (list-to-seq args) f))
+
+(def: alias^
+  (s;Syntax (Maybe Text))
+  (s;opt (do s;Monad<Syntax>
+           [_ (s;tag! ["" "as"])]
+           s;local-symbol)))
+
+(type: Method-Modifiers
+  {#io Bool
+   #try Bool})
+
+(type: Type-Var Text)
+
+(type: #rec Class
+  {#name Text
+   #params (List Class)})
+
+(type: Instance [Bool Class])
+
+(type: Import
+  (#Function (List Text) Text (List Instance) Method-Modifiers Instance)
+  (#Const Text Instance))
+
+(def: method-modifiers^
+  (s;Syntax Method-Modifiers)
+  (s;seq (s;tag? ["" "io"])
+         (s;tag? ["" "try"])))
+
+(def: (class^ tvars)
+  (-> (List Type-Var) (s;Syntax Class))
+  (s;either (s;seq s;local-symbol (:: s;Monad<Syntax> wrap (list)))
+            (s;form (do s;Monad<Syntax>
+                      [name s;local-symbol
+                       _ (s;assert "Can't parameterize type-vars!"
+                                   (list;member? text;Eq<Text> tvars name))
+                       params (s;many (class^ tvars))]
+                      (wrap {#name name #params params})))))
+
+(def: (instance^ tvars)
+  (-> (List Type-Var) (s;Syntax Instance))
+  (s;seq (s;tag? ["" "?"])
+         (class^ tvars)))
+
+(def: import^
+  (s;Syntax Import)
+  (s;form (s;alt (do s;Monad<Syntax>
+                   [tvars (|> s;local-symbol s;some s;tuple (s;default (list)))
+                    name s;local-symbol
+                    input (s;tuple (s;some (instance^ tvars)))
+                    modifiers method-modifiers^
+                    output (instance^ tvars)]
+                   (wrap [tvars name input modifiers output]))
+                 (s;seq s;local-symbol
+                        (instance^ (list)))
+                 )))
+
+(def: (index-of' idx tvars name)
+  (-> Nat (List Type-Var) Type-Var (Maybe Nat))
+  (case tvars
+    #;Nil
+    #;None
+
+    (#;Cons var tvars')
+    (if (Text/= var name)
+      (#;Some idx)
+      (index-of' (n.inc idx) tvars' name))))
+
+(def: (index-of tvars name)
+  (-> (List Type-Var) Type-Var (Maybe Nat))
+  (index-of' +0 tvars name))
+
+(def: (class-to-type strict? tvars [name params])
+  (-> Bool (List Type-Var) Class AST)
+  (case (index-of tvars name)
+    (#;Some idx)
+    (if strict?
+      (ast;local-symbol name)
+      (` (;$ (~ (ast;nat idx)))))
+
+    #;None
+    (` (;host (~ (ast;local-symbol name))
+              [(~@ (List/map (class-to-type strict? tvars) params))]))))
+
+(def: (instance-to-type strict? tvars [nullable? class])
+  (-> Bool (List Type-Var) Instance AST)
+  (if nullable?
+    (` (Maybe (~ (class-to-type strict? tvars class))))
+    (class-to-type strict? tvars class)))
+
+(def: (process-instance tvars [nullable? [name params]])
+  (-> (List Type-Var) Instance (Lux Instance))
+  (do Monad<Lux>
+    [resolved (if (list;member? text;Eq<Text> tvars name)
+                (wrap name)
+                (host;resolve-class name))]
+    (wrap [nullable? {#name resolved #params params}])))
+
+(def: (tester tvars [nullable? [name params]])
+  (-> (List Type-Var) Instance AST)
+  (let [name (if (list;member? text;Eq<Text> tvars name)
+               "java.lang.Object"
+               name)]
+    (if nullable?
+      (` (lambda [(~' sample)] (or (host;null? (~' sample))
+                              (host;instance? (~ (ast;local-symbol name))
+                                              (~' sample)))))
+      (` (lambda [(~' sample)] (host;instance? (~ (ast;local-symbol name))
+                                          (~' sample)))))))
+
+(def: (cast class object)
+  (-> AST AST AST)
+  (` (:! (~ class) (~ object))))
+
+(def: (process-method modifiers body)
+  (-> Method-Modifiers AST AST)
+  (let [body (if (get@ #try modifiers)
+               (` (host;try (~ body)))
+               body)
+        body (if (get@ #io modifiers)
+               (` (io;io (~ body)))
+               body)]
+    body))
+
+(def: (process-method-type modifiers type)
+  (-> Method-Modifiers AST AST)
+  (let [type (if (get@ #try modifiers)
+               (` (Either Text (~ type)))
+               type)
+        type (if (get@ #io modifiers)
+               (` (io;IO (~ type)))
+               type)]
+    type))
+
+(syntax: #export (clj-import {module s;local-symbol}
+                             {alias alias^}
+                             {imports (s;many import^)})
+  (do @
+    [#let [module-prefix (case alias
+                           #;None (format module "/")
+                           (#;Some "_") ""
+                           (#;Some prefix) (format prefix "/"))]
+     import-defs (mapM @ (lambda [import]
+                           (case import
+                             (#Function tvars name inputs modifiers output)
+                             (do @
+                               [inputs (mapM @ (process-instance tvars) inputs)
+                                output (process-instance tvars output)
+                                g!func (compiler;gensym "func")
+                                g!inputs (mapM @ (lambda [_] (compiler;gensym "arg")) inputs)
+                                #let [base-body (` (<| (~@ (if (product;left output) (list (` host;???)) (list)))
+                                                       (@post (~ (tester tvars output)))
+                                                       (default (~ (if (product;left output)
+                                                                     (` (host;null))
+                                                                     (` (;undefined))))
+                                                         (;;apply (list (~@ (List/map (cast (` (;host (~' java.lang.Object))))
+                                                                                      g!inputs)))
+                                                                  (~ g!func)))))
+                                      body (process-method modifiers base-body)
+                                      lux-output-type (process-method-type modifiers (instance-to-type true tvars output))
+                                      jvm-output-type (process-method-type modifiers (instance-to-type false tvars output))
+                                      body (` (:! (~ jvm-output-type) (~ body)))
+                                      func-type (case inputs
+                                                  #;Nil (` (-> [] (~ lux-output-type)))
+                                                  _ (` (-> (~@ (List/map (instance-to-type true tvars) inputs)) (~ lux-output-type))))
+                                      func-type (` (All [(~@ (List/map ast;local-symbol tvars))] (~ func-type)))]]
+                               (wrap (` (def: (~ (ast;local-symbol (format module-prefix name)))
+                                          {#;;clojure-var true}
+                                          (~ func-type)
+                                          (exec (;;apply (list (;;symbol ["" (~ (ast;text module))])) ;;clojure.core/require)
+                                            (let [(~ g!func) (<| (:! (host (~' clojure.lang.IFn)))
+                                                                 (@post (host;instance? (~' clojure.lang.IFn)))
+                                                                 (find-var [(~ (ast;text module)) (~ (ast;text name))]))]
+                                              (lambda [(~@ g!inputs)]
+                                                (~ body))))))))
+                             
+                             (#Const name class)
+                             (do @
+                               [class (process-instance (list) class)]
+                               (wrap (` (def: (~ (ast;local-symbol (format module-prefix name)))
+                                          {#;;clojure-var true}
+                                          (~ (instance-to-type true (list) class))
+                                          (exec (;;apply (list (;;symbol ["" (~ (ast;text module))])) ;;clojure.core/require)
+                                            (<| (:! (~ (instance-to-type false (list) class)))
+                                                (~@ (if (product;left class) (list (` host;???)) (list)))
+                                                (@post (~ (tester (list) class)))
+                                                (find-var [(~ (ast;text module)) (~ (ast;text name))])))))))
+                             ))
+                       imports)]
+    (wrap import-defs)))
