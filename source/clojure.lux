@@ -12,9 +12,11 @@
              text/format
              [product]
              (struct [array]
+                     [dict #+ Dict]
                      [list "List/" Monad<List>]))
        (macro [ast]
               ["s" syntax #+ syntax:])
+       [type]
        [host #+ jvm-import]))
 
 (jvm-import clojure.lang.IDeref
@@ -161,12 +163,29 @@
     (` (Maybe (~ (class-to-type strict? tvars class))))
     (class-to-type strict? tvars class)))
 
+(def: array-mappings
+  (Dict Text Text)
+  (|> (dict;new text;Hash<Text>)
+      (dict;put "Boolean-Array" "[Z")
+      (dict;put "Byte-Array" "[B")
+      (dict;put "Short-Array" "[S")
+      (dict;put "Int-Array" "[I")
+      (dict;put "Long-Array" "[J")
+      (dict;put "Float-Array" "[F")
+      (dict;put "Double-Array" "[D")
+      (dict;put "Char-Array" "[C")))
+
 (def: (process-instance tvars [nullable? [name params]])
   (-> (List Type-Var) Instance (Lux Instance))
   (do Monad<Lux>
-    [resolved (if (list;member? text;Eq<Text> tvars name)
-                (wrap name)
-                (host;resolve-class name))]
+    [resolved (case (dict;get name array-mappings)
+                (#;Some array-class)
+                (wrap array-class)
+
+                #;None
+                (if (list;member? text;Eq<Text> tvars name)
+                  (wrap name)
+                  (host;resolve-class name)))]
     (wrap [nullable? {#name resolved #params params}])))
 
 (def: (tester tvars [nullable? [name params]])
@@ -245,7 +264,8 @@
                                                                  (@post (host;instance? (~' clojure.lang.IFn)))
                                                                  (find-var [(~ (ast;text module)) (~ (ast;text name))]))]
                                               (lambda [(~@ g!inputs)]
-                                                (~ body))))))))
+                                                (~ body)))))))
+                               )
                              
                              (#Const name class)
                              (do @
@@ -257,7 +277,42 @@
                                             (<| (:! (~ (instance-to-type false (list) class)))
                                                 (~@ (if (product;left class) (list (` host;???)) (list)))
                                                 (@post (~ (tester (list) class)))
-                                                (find-var [(~ (ast;text module)) (~ (ast;text name))])))))))
+                                                (find-var [(~ (ast;text module)) (~ (ast;text name))]))))))
+                               )
                              ))
                        imports)]
     (wrap import-defs)))
+
+(syntax: #export (function {lux-func (s;alt s;symbol
+                                            s;any)})
+  (case lux-func
+    (#;Left lux-func)
+    (do @
+      [func-type (compiler;find-type lux-func)
+       #let [[num-args func-type'] (type;flatten-univq func-type)
+             [inputs output] (type;flatten-function func-type')]
+       g!inputs (mapM @ (lambda [_] (compiler;gensym "g!input"))
+                      inputs)
+       #let [input-decls (List/map (lambda [g!input]
+                                     (` {(~ g!input) (~' java.lang.Object)}))
+                                   g!inputs)
+             typed-inputs (List/map (lambda [[g!input type]]
+                                      (` (:! (~ (type;to-ast type)) (~ g!input))))
+                                    (list;zip2 g!inputs inputs))]]
+      (case inputs
+        #;Nil
+        (compiler;fail (format "Can't turn into IFn: " (%type func-type)))
+
+        _
+        (wrap (list (` (host;object (~' clojure.lang.AFunction) []
+                         []
+                         ((~' clojure.lang.AFunction) ((~' invoke) (~@ input-decls)) (~' java.lang.Object)
+                          (:! (;host (~' java.lang.Object))
+                              ((~ (ast;symbol lux-func)) (~@ typed-inputs))))
+                         ))))))
+
+    (#;Right lux-func)
+    (do @
+      [g!lux-func (compiler;gensym "lux-func")]
+      (wrap (list (` (let [(~ g!lux-func) (~ lux-func)]
+                       (;;function (~ g!lux-func)))))))))
