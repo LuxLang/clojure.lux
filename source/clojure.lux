@@ -53,27 +53,37 @@
 (jvm-import java.lang.Object
   (toString [] String))
 
-(def: #hidden (find-var name)
-  (-> Ident Object)
+(def: #export (find-var name)
+  (-> Ident (Maybe Object))
   (|> name
       Clojure.var
       (:! Var)
       (@post (Var.isBound []))
       (IDeref.deref [])
-      (default (host;null))
       ))
-
-(def: #hidden clojure.core/require
-  IFn
-  (:! IFn (find-var ["clojure.core" "require"])))
 
 (def: (list-to-seq xs)
   (-> (List Object) ArraySeq)
   (|> xs array;from-list ArraySeq.create))
 
-(def: #hidden (apply args f)
+(def: #export (apply args f)
   (-> (List Object) IFn (Maybe Object))
   (IFn.applyTo (list-to-seq args) f))
+
+(def: clojure.core/require
+  IFn
+  (<| (:! IFn)
+      (default (undefined))
+      (find-var ["clojure.core" "require"])))
+
+(def: #export (require ns)
+  (-> Text Bool)
+  (case (host;try (apply (list (symbol ["" ns])) clojure.core/require))
+    (#;Left error)
+    false
+
+    (#;Right _)
+    true))
 
 (def: alias^
   (s;Syntax (Maybe Text))
@@ -259,13 +269,13 @@
                                (wrap (` (def: (~ (ast;local-symbol (format module-prefix name)))
                                           {#;;clojure-var true}
                                           (~ func-type)
-                                          (exec (;;apply (list (;;symbol ["" (~ (ast;text module))])) ;;clojure.core/require)
+                                          (exec (;;require (~ (ast;text module)))
                                             (let [(~ g!func) (<| (:! (host (~' clojure.lang.IFn)))
                                                                  (@post (host;instance? (~' clojure.lang.IFn)))
+                                                                 (default (;undefined))
                                                                  (find-var [(~ (ast;text module)) (~ (ast;text name))]))]
                                               (lambda [(~@ g!inputs)]
-                                                (~ body)))))))
-                               )
+                                                (~ body))))))))
                              
                              (#Const name class)
                              (do @
@@ -273,18 +283,18 @@
                                (wrap (` (def: (~ (ast;local-symbol (format module-prefix name)))
                                           {#;;clojure-var true}
                                           (~ (instance-to-type true (list) class))
-                                          (exec (;;apply (list (;;symbol ["" (~ (ast;text module))])) ;;clojure.core/require)
+                                          (exec (;;require (~ (ast;text module)))
                                             (<| (:! (~ (instance-to-type false (list) class)))
                                                 (~@ (if (product;left class) (list (` host;???)) (list)))
                                                 (@post (~ (tester (list) class)))
-                                                (find-var [(~ (ast;text module)) (~ (ast;text name))]))))))
-                               )
+                                                (default (;undefined))
+                                                (find-var [(~ (ast;text module)) (~ (ast;text name))])))))))
                              ))
                        imports)]
     (wrap import-defs)))
 
-(syntax: #export (function {lux-func (s;alt s;symbol
-                                            s;any)})
+(syntax: #export (function-for {lux-func (s;alt s;symbol
+                                                s;any)})
   (case lux-func
     (#;Left lux-func)
     (do @
@@ -315,4 +325,4 @@
     (do @
       [g!lux-func (compiler;gensym "lux-func")]
       (wrap (list (` (let [(~ g!lux-func) (~ lux-func)]
-                       (;;function (~ g!lux-func)))))))))
+                       (;;function-for (~ g!lux-func)))))))))
